@@ -26,11 +26,18 @@ MAX_SEED = np.iinfo(np.int32).max
 
 @torch.inference_mode()
 def generate(prompt=None, batch_size=1, max_len=512, temp=1.0, top_p=0.98, top_k=20,
-             disable_patch_change=False, disable_control_change=False, disable_channels=None, generator=None):
+             disable_patch_change=False, disable_control_change=False,
+             disable_channels=None, disable_tracks=None,
+             original_events=None, generator=None):
     if disable_channels is not None:
         disable_channels = [tokenizer.parameter_ids["channel"][c] for c in disable_channels]
     else:
         disable_channels = []
+    if disable_tracks is not None:
+        disable_tracks = [tokenizer.parameter_ids["track"][t] for t in disable_tracks]
+    else:
+        disable_tracks = []
+
     max_token_seq = tokenizer.max_token_seq
     if prompt is None:
         input_tensor = torch.full((1, max_token_seq), tokenizer.pad_id, dtype=torch.long, device=model.device)
@@ -51,6 +58,16 @@ def generate(prompt=None, batch_size=1, max_len=512, temp=1.0, top_p=0.98, top_k
                             mode="constant", constant_values=tokenizer.pad_id)
         input_tensor = torch.from_numpy(prompt).to(dtype=torch.long, device=model.device)
     input_tensor = input_tensor[:, -4096:]
+
+    last_abs_time = [0] * batch_size
+    for b in range(batch_size):
+        t1_acc = 0
+        for tokens in input_tensor[b]:
+            event = tokenizer.tokens2event(tokens.tolist())
+            if event:
+                t1_acc += event[1]
+                last_abs_time[b] = t1_acc * 16 + event[2]
+
     cur_len = input_tensor.shape[1]
     bar = tqdm.tqdm(desc="generating", total=max_len - cur_len)
     cache1 = DynamicCache()
@@ -59,57 +76,105 @@ def generate(prompt=None, batch_size=1, max_len=512, temp=1.0, top_p=0.98, top_k
         while cur_len < max_len:
             end = [False] * batch_size
             hidden = model.forward(input_tensor[:, past_len:], cache=cache1)[:, -1]
-            next_token_seq = None
-            event_names = [""] * batch_size
+            proposed_tokens = None
+            proposed_event_names = [""] * batch_size
+            proposed_end = [False] * batch_size
             cache2 = DynamicCache()
             for i in range(max_token_seq):
-                mask = torch.zeros((batch_size, tokenizer.vocab_size), dtype=torch.int64, device=model.device)
+                mask = torch.zeros((batch_size, tokenizer.vocab_size), dtype=torch.long, device=model.device)
                 for b in range(batch_size):
-                    if end[b]:
+                    if proposed_end[b]:
                         mask[b, tokenizer.pad_id] = 1
                         continue
                     if i == 0:
                         mask_ids = list(tokenizer.event_ids.values()) + [tokenizer.eos_id]
                         if disable_patch_change:
-                            mask_ids.remove(tokenizer.event_ids["patch_change"])
+                            if tokenizer.event_ids["patch_change"] in mask_ids:
+                                mask_ids.remove(tokenizer.event_ids["patch_change"])
                         if disable_control_change:
-                            mask_ids.remove(tokenizer.event_ids["control_change"])
+                            if tokenizer.event_ids["control_change"] in mask_ids:
+                                mask_ids.remove(tokenizer.event_ids["control_change"])
                         mask[b, mask_ids] = 1
                     else:
-                        param_names = tokenizer.events[event_names[b]]
+                        param_names = tokenizer.events[proposed_event_names[b]]
                         if i > len(param_names):
                             mask[b, tokenizer.pad_id] = 1
                             continue
-                        param_name = param_names[i - 1]
-                        mask_ids = tokenizer.parameter_ids[param_name]
-                        if param_name == "channel":
-                            mask_ids = [i for i in mask_ids if i not in disable_channels]
+                        p_name = param_names[i - 1]
+                        mask_ids = tokenizer.parameter_ids[p_name]
+                        if p_name == "channel" and disable_channels is not None:
+                            mask_ids = [idx for idx in mask_ids if idx not in disable_channels]
+                        if p_name == "track" and disable_tracks is not None:
+                            mask_ids = [idx for idx in mask_ids if idx not in disable_tracks]
                         mask[b, mask_ids] = 1
                 mask = mask.unsqueeze(1)
-                x = next_token_seq
+                x = proposed_tokens
                 if i != 0:
-                    hidden = None
+                    temp_hidden = None
                     x = x[:, -1:]
-                logits = model.forward_token(hidden, x, cache=cache2)[:, -1:]
+                else:
+                    temp_hidden = hidden
+                logits = model.forward_token(temp_hidden, x, cache=cache2)[:, -1:]
                 scores = torch.softmax(logits / temp, dim=-1) * mask
                 samples = model.sample_top_p_k(scores, top_p, top_k, generator=generator)
                 if i == 0:
-                    next_token_seq = samples
+                    proposed_tokens = samples
                     for b in range(batch_size):
-                        if end[b]:
-                            continue
+                        if proposed_end[b]: continue
                         eid = samples[b].item()
-                        if eid == tokenizer.eos_id:
-                            end[b] = True
-                        else:
-                            event_names[b] = tokenizer.id_events[eid]
+                        if eid == tokenizer.eos_id: proposed_end[b] = True
+                        else: proposed_event_names[b] = tokenizer.id_events[eid]
                 else:
-                    next_token_seq = torch.cat([next_token_seq, samples], dim=1)
-                    if all([len(tokenizer.events[event_names[b]]) == i for b in range(batch_size) if not end[b]]):
+                    proposed_tokens = torch.cat([proposed_tokens, samples], dim=1)
+                    if all([len(tokenizer.events[proposed_event_names[b]]) == i for b in range(batch_size) if not proposed_end[b]]):
                         break
-            if next_token_seq.shape[1] < max_token_seq:
-                next_token_seq = F.pad(next_token_seq, (0, max_token_seq - next_token_seq.shape[1]),
-                                       "constant", value=tokenizer.pad_id)
+
+            if proposed_tokens.shape[1] < max_token_seq:
+                proposed_tokens = F.pad(proposed_tokens, (0, max_token_seq - proposed_tokens.shape[1]),
+                                        "constant", value=tokenizer.pad_id)
+
+            # Interleave logic
+            next_token_seq = proposed_tokens.clone()
+            end = [False] * batch_size
+            for b in range(batch_size):
+                e_prop = tokenizer.tokens2event(proposed_tokens[b].tolist())
+                t_prev = last_abs_time[b]
+                t1_prev = t_prev // 16
+                
+                if e_prop:
+                    t_prop = (t1_prev + e_prop[1]) * 16 + e_prop[2]
+                    t_prop = max(t_prop, t_prev)  # Safety clamp
+                else:
+                    t_prop = float('inf')
+                
+                if original_events is not None and original_events[b]:
+                    e_orig_data = original_events[b][0]
+                    t_orig = e_orig_data["abs_time"]
+                    
+                    if t_orig <= t_prop:
+                        # Use original event instead of proposed
+                        ev = list(e_orig_data["event"])
+                        # Correct delta_t1 and abs_t2 for the tokenizer format
+                        ev[1] = (t_orig // 16) - t1_prev
+                        ev[2] = t_orig % 16
+                        
+                        tokens = tokenizer.event2tokens(ev)
+                        if len(tokens) < max_token_seq:
+                            tokens += [tokenizer.pad_id] * (max_token_seq - len(tokens))
+                        next_token_seq[b] = torch.tensor(tokens, device=model.device, dtype=torch.long)
+                        
+                        original_events[b].pop(0)
+                        last_abs_time[b] = t_orig
+                    else:
+                        # Use proposed event
+                        last_abs_time[b] = t_prop
+                        if proposed_end[b]: end[b] = True
+                else:
+                    # No original events left, use proposed
+                    if e_prop:
+                        last_abs_time[b] = t_prop
+                    if proposed_end[b]: end[b] = True
+
             next_token_seq = next_token_seq.unsqueeze(1)
             input_tensor = torch.cat([input_tensor, next_token_seq], dim=1)
             past_len = cur_len
@@ -129,9 +194,15 @@ def send_msgs(msgs):
 
 
 def run(tab, mid_seq, continuation_state, continuation_select, instruments, drum_kit, bpm, time_sig, key_sig, mid,
-        midi_events,  reduce_cc_st, remap_track_channel, add_default_instr, remove_empty_channels, seed, seed_rand,
-        gen_events, temp, top_p, top_k, allow_cc):
+        midi_events, add_track_mid, add_track_midi_events, add_track_reduce_cc_st, add_track_remap_track_channel,
+        add_track_add_default_instr, add_track_remove_empty_channels,
+        add_track_context_events,
+        add_track_instruments, add_track_drum_kit,
+        reduce_cc_st, remap_track_channel, add_default_instr, remove_empty_channels,
+        seed, seed_rand, gen_events, temp, top_p, top_k, allow_cc):
     bpm = int(bpm)
+    original_events = None
+    disable_tracks = None
     if time_sig == "auto":
         time_sig = None
         time_sig_nn = 4
@@ -199,6 +270,75 @@ def run(tab, mid_seq, continuation_state, continuation_select, instruments, drum
             mid_seq = mid.tolist()
         else:
             continuation_state.append(mid.shape[1])
+    elif tab == 3 and add_track_mid is not None:
+        eps = 4 if add_track_reduce_cc_st else 0
+        all_tokens = tokenizer.tokenize(MIDI.midi2score(add_track_mid), cc_eps=eps, tempo_eps=eps,
+                                        remap_track_channel=add_track_remap_track_channel,
+                                        add_default_instr=add_track_add_default_instr,
+                                        remove_empty_channels=add_track_remove_empty_channels)
+        limit = int(add_track_midi_events)
+        if limit <= 4096: all_tokens = all_tokens[:limit]
+
+        prompt = []
+        all_music_events = []
+        t1_acc = 0
+        for tokens in all_tokens:
+            event = tokenizer.tokens2event(tokens)
+            if not event: continue
+            t1_acc += event[1]
+            abs_t = t1_acc * 16 + event[2]
+            
+            # Separate setup tokens (BOS or meta at t=0) from actual music events
+            if event[0] == "bos" or (abs_t == 0 and event[0] not in ["note", "eos"]):
+                prompt.append(tokens)
+            elif event[0] != "eos":
+                all_music_events.append({"tokens": tokens, "event": event, "abs_time": abs_t})
+
+        # Take n events as context (added to prompt, Proposal phase disabled for these)
+        n_context = int(add_track_context_events)
+        for i in range(min(n_context, len(all_music_events))):
+            prompt.append(all_music_events[i]["tokens"])
+        
+        music_events = [{"event": e["event"], "abs_time": e["abs_time"]} for e in all_music_events[n_context:]]
+
+        used_channels = set()
+        used_tracks = set()
+        for tokens in all_tokens:
+            ev = tokenizer.tokens2event(tokens)
+            if not ev: continue
+            if ev[0] in ["note", "patch_change", "control_change"]:
+                c_idx = 5 if (ev[0] == "note" and tokenizer.version == "v1") else 4
+                if c_idx < len(ev): used_channels.add(ev[c_idx])
+            used_tracks.add(ev[3])
+
+        new_channels = []
+        new_tracks = []
+        max_track = max(list(used_tracks) + [0])
+
+        if add_track_instruments:
+            next_channel = 0
+            for instr in add_track_instruments:
+                while next_channel in used_channels or next_channel == 9: next_channel += 1
+                if next_channel > 15: break
+                max_track += 1
+                prompt.append(tokenizer.event2tokens(["patch_change", 0, 0, max_track, next_channel, patch2number[instr]]))
+                used_channels.add(next_channel)
+                new_channels.append(next_channel)
+                new_tracks.append(max_track)
+        if add_track_drum_kit != "None" and 9 not in used_channels:
+            max_track += 1
+            prompt.append(tokenizer.event2tokens(["patch_change", 0, 0, max_track, 9, drum_kits2number[add_track_drum_kit]]))
+            new_channels.append(9)
+            new_tracks.append(max_track)
+
+        if len(new_channels) > 0:
+            disable_patch_change = True
+            disable_channels = [c for c in range(16) if c not in new_channels]
+            disable_tracks = [t for t in range(128) if t not in new_tracks]
+
+        mid = np.asarray([prompt] * OUTPUT_BATCH_SIZE, dtype=np.int64)
+        mid_seq = mid.tolist()
+        original_events = [music_events[:] for _ in range(OUTPUT_BATCH_SIZE)]
     else:
         continuation_state = [0]
         mid = [[tokenizer.bos_id] + [tokenizer.pad_id] * (tokenizer.max_token_seq - 1)]
@@ -218,6 +358,8 @@ def run(tab, mid_seq, continuation_state, continuation_select, instruments, drum
     midi_generator = generate(mid, batch_size=OUTPUT_BATCH_SIZE, max_len=max_len, temp=temp,
                               top_p=top_p, top_k=top_k, disable_patch_change=disable_patch_change,
                               disable_control_change=not allow_cc, disable_channels=disable_channels,
+                              disable_tracks=disable_tracks,
+                              original_events=original_events,
                               generator=generator)
     events = [list() for i in range(OUTPUT_BATCH_SIZE)]
     t = time.time()
@@ -424,6 +566,8 @@ if __name__ == "__main__":
                 example1 = gr.Examples([
                     [[], "None"],
                     [["Acoustic Grand"], "None"],
+                    [["Flute", "Synth Voice", "Pad 4 (Choir)", "Overdriven Guitar", "Distortion Guitar",
+                      "Electric Bass(finger)"], "Standard"],
                     [['Acoustic Grand', 'SynthStrings 2', 'SynthStrings 1', 'Pizzicato Strings',
                       'Pad 2 (warm)', 'Tremolo Strings', 'String Ensemble 1'], "Orchestra"],
                     [['Trumpet', 'Oboe', 'Trombone', 'String Ensemble 1', 'Clarinet',
@@ -454,10 +598,31 @@ if __name__ == "__main__":
                                                type="index"
                                                )
                 undo_btn = gr.Button("undo the last continuation")
+            with gr.TabItem("add track") as tab4:
+                gr.Markdown("Add a new track based on an uploaded MIDI file.")
+                input_add_track_midi = gr.File(label="input midi", file_types=[".midi", ".mid"], type="binary")
+                input_add_track_midi_events = gr.Slider(label="use first n midi events as prompt (all if 4097)",
+                                                        minimum=1, maximum=4097, step=1, value=128)
+                input_add_track_reduce_cc_st = gr.Checkbox(label="reduce control_change and set_tempo events",
+                                                           value=True)
+                input_add_track_remap_track_channel = gr.Checkbox(
+                    label="remap tracks and channels so each track has only one channel and in order", value=True)
+                input_add_track_add_default_instr = gr.Checkbox(
+                    label="add a default instrument to channels that don't have an instrument", value=True)
+                input_add_track_remove_empty_channels = gr.Checkbox(label="remove channels without notes",
+                                                                    value=False)
+                input_add_track_context_events = gr.Slider(label="context events from original (proposing disabled)",
+                                                        minimum=0, maximum=4096, step=1, value=128)
+                input_add_track_instruments = gr.Dropdown(label="🪗instruments to add", choices=list(patch2number.keys()),
+                                                multiselect=True, max_choices=15, type="value")
+                input_add_track_drum_kit = gr.Dropdown(label="🥁drum kit to add", choices=list(drum_kits2number.keys()), type="value",
+                                             value="None")
+                undo_btn_track = gr.Button("undo the last addition")
 
         tab1.select(lambda: 0, None, tab_select, queue=False)
         tab2.select(lambda: 1, None, tab_select, queue=False)
         tab3.select(lambda: 2, None, tab_select, queue=False)
+        tab4.select(lambda: 3, None, tab_select, queue=False)
         input_seed = gr.Slider(label="seed", minimum=0, maximum=2 ** 31 - 1,
                                step=1, value=0)
         input_seed_rand = gr.Checkbox(label="random seed", value=True)
@@ -488,6 +653,15 @@ if __name__ == "__main__":
         run_event = run_btn.click(run, [tab_select, output_midi_seq, output_continuation_state,
                                         input_continuation_select, input_instruments, input_drum_kit, input_bpm,
                                         input_time_sig, input_key_sig, input_midi, input_midi_events,
+                                        input_add_track_midi,
+                                        input_add_track_midi_events,
+                                        input_add_track_reduce_cc_st,
+                                        input_add_track_remap_track_channel,
+                                        input_add_track_add_default_instr,
+                                        input_add_track_remove_empty_channels,
+                                        input_add_track_context_events,
+                                        input_add_track_instruments,
+                                        input_add_track_drum_kit,
                                         input_reduce_cc_st, input_remap_track_channel,
                                         input_add_default_instr, input_remove_empty_channels,
                                         input_seed, input_seed_rand, input_gen_events, input_temp, input_top_p,
@@ -504,6 +678,8 @@ if __name__ == "__main__":
                               queue=False)
         stop_btn.click(None, [], [], cancels=run_event, queue=False)
         undo_btn.click(undo_continuation, [output_midi_seq, output_continuation_state],
+                       [output_midi_seq, output_continuation_state, js_msg], queue=False)
+        undo_btn_track.click(undo_continuation, [output_midi_seq, output_continuation_state],
                        [output_midi_seq, output_continuation_state, js_msg], queue=False)
     # load_javascript not work on ssr mode
     app.launch(server_port=opt.port, inbrowser=True, share=opt.share, ssr_mode=False)
